@@ -125,8 +125,9 @@ describe('request-level dynamic profiles', () => {
 
   it('allows removing an obsolete override and deleting a route whose catalog cannot be built', async () => {
     const dir = await home()
+    const server = await mockServer([{ body: '{"data":[]}' }])
     const stored = { providers: {
-      anthropic: { modelOverrides: { 'removed-model': { maxTokens: 4096 } } },
+      anthropic: { baseURL: server.url, modelOverrides: { 'removed-model': { maxTokens: 4096 } } },
       'retired-route': {},
     } }
     const ctx = await boot(dir, stored)
@@ -151,7 +152,7 @@ describe('request-level dynamic profiles', () => {
       'version: 1\nrefs:\n  PI_DYNAMIC_KEY: pk-from-settings\n  PI_LIVE_KEY: live-key\n  PI_OTHER_KEY: other\n',
       { mode: 0o600 },
     )
-    const server = await mockServer([{ events: textEvents }])
+    const server = await mockServer([{ body: '{"data":[]}' }, { events: textEvents }])
     // The exact product posture: `- id: llm-pi-ai` with no config at all.
     const ctx = await boot(dir, {})
 

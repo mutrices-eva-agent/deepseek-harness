@@ -1,11 +1,12 @@
 /**
  * Generic pi-ai-backed implementation of the Harness LLM seam.
  *
- * Each resolution produces one **immutable** snapshot — the profiles plus a
+ * Each configuration resolution produces one snapshot — the profiles plus a
  * `Models` collection holding the `Provider` each route built — and an
- * operation captures a whole snapshot before its first `await`. A
- * configuration change builds a *new* collection rather than mutating the one
- * in use, because `Models.streamSimple()` is lazy: it resolves the provider
+ * operation captures a whole snapshot before its first `await`. Provider
+ * listings update only the snapshot's catalog view. A configuration change
+ * builds a *new* collection rather than mutating the one in use, because
+ * `Models.streamSimple()` is lazy: it resolves the provider
  * when the stream is first consumed, which is after the credential await, so a
  * mutated collection would let a request that started under one configuration
  * finish under another — or fail with a provider that no longer exists. This is
@@ -26,6 +27,7 @@
  * @module dsh-llm-pi-ai/adapter
  */
 
+import { createHash } from 'node:crypto'
 import type {
   Api,
   AuthContext,
@@ -57,7 +59,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
+import { deadline, idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
+import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { requestImageTarget, toPiContext } from './context.ts'
 import { resolveImageRequestBudget } from './image-policy.ts'
@@ -65,6 +68,7 @@ import { conversationUpdates, createModels, getSupportedThinkingLevels } from '.
 import { toStreamChunks } from './stream.ts'
 import { bindThinkingToPrefix } from './prefix-binding.ts'
 import type { PrefixDigests } from './prefix-binding.ts'
+import type { ProviderListingAuth } from './sync.ts'
 import type { PiAiRequestHeaderContext } from './types.ts'
 
 /**
@@ -77,15 +81,52 @@ const ANTHROPIC_TOOL_UPDATE_PLACEHOLDER: ToolSchema = {
   parameters: { type: 'object', properties: {} },
 }
 
+interface ProviderCatalogState {
+  /** Credential and endpoint identity currently visible to readers. */
+  activeScope?: string
+  /** Last successful catalog in the active scope. */
+  synced?: { scope: string; models: readonly Model<Api>[] }
+  /** Publication version, incremented whenever scope changes. */
+  generation: number
+  /** Shared work for one scope; retained until the operation actually settles. */
+  inflight?: { scope: string; operation: Promise<void> }
+}
+
 /** One resolution's frozen view: the profiles and the collection built from them. */
 interface PiAiSnapshot {
   /** The resolved profiles this collection was built from, used as its identity. */
   profiles: ReadonlyMap<string, ResolvedPiAiProviderProfile>
-  /** Providers for exactly those profiles; never mutated once published. */
+  /** Providers for exactly those profiles; request routing stays on this collection. */
   models: Models
+  /** Credential-scoped catalog state by provider. */
+  catalogs: Map<string, ProviderCatalogState>
 }
 
-/** Constructor options for {@link PiAiAdapter}: the two resolution hooks the plugin owns. */
+/** Hash credentials rather than retaining a second readable copy as a catalog key. */
+function listingScope(auth: ProviderListingAuth): string {
+  const headers = auth.headers
+  return createHash('sha256').update(JSON.stringify({
+    apiKey: auth.apiKey,
+    headers,
+    baseURL: auth.baseURL,
+  })).digest('hex')
+}
+
+/** Wait for shared listing work without making one caller's cancellation cancel the others. */
+async function waitForSync(task: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+  if (signal === undefined) return task
+  signal.throwIfAborted()
+  const abandoned = Promise.withResolvers<never>()
+  const abandon = (): void => { abandoned.reject(signal.reason) }
+  signal.addEventListener('abort', abandon, { once: true })
+  try {
+    await Promise.race([task, abandoned.promise])
+  } finally {
+    signal.removeEventListener('abort', abandon)
+  }
+}
+
+/** Constructor options for {@link PiAiAdapter}: profile, credential, catalog, and request hooks the plugin owns. */
 export interface PiAiAdapterOptions {
   /** Current validated profiles by provider route; called once per operation. */
   profiles: () => ReadonlyMap<string, ResolvedPiAiProviderProfile>
@@ -99,6 +140,20 @@ export interface PiAiAdapterOptions {
    * `MISSING_CREDENTIAL` rather than falling back.
    */
   resolveApiKey: (provider: string, profile: ResolvedPiAiProviderProfile) => Promise<string | undefined>
+  /**
+   * Load one route's latest provider catalog. Omission keeps only its installed or explicitly configured models.
+   * The result replaces the route's advertised baseline after a successful load; failures retain the last good catalog.
+   */
+  syncModels?: (
+    provider: string,
+    profile: ResolvedPiAiProviderProfile,
+    auth: ProviderListingAuth,
+    signal: AbortSignal,
+  ) => Promise<readonly Model<Api>[] | undefined>
+  /** Publish a successfully changed provider catalog after readers can resolve it. */
+  onModelsUpdated?: (provider: string) => void
+  /** Report a failed automatic catalog load while the previous catalog remains available. */
+  onModelSyncError?: (detail: { provider: string; error: unknown }) => void
   /**
    * How every collection this adapter builds resolves auth the request-level
    * `apiKey` override does not cover. Required rather than optional: a
@@ -282,6 +337,9 @@ function requestHeaders(
  */
 export class PiAiAdapter extends LlmAdapter {
   private snapshot: PiAiSnapshot | undefined
+  private closed = false
+  private readonly syncControllers = new Set<AbortController>()
+  private readonly syncOperations = new Set<Promise<void>>()
 
   constructor(private readonly config: PiAiAdapterOptions) {
     super()
@@ -304,11 +362,31 @@ export class PiAiAdapter extends LlmAdapter {
     const profiles = this.config.profiles()
     if (this.snapshot?.profiles === profiles) return this.snapshot
     const models: MutableModels = createModels(this.config.auth)
+    const snapshot: PiAiSnapshot = { profiles, models, catalogs: new Map() }
     for (const profile of profiles.values()) {
-      if (profile.piProvider !== undefined) models.setProvider(profile.piProvider)
+      const baseline = profile.piProvider
+      if (baseline === undefined) continue
+      const state = this.catalogState(snapshot, profile.provider)
+      models.setProvider({
+        ...baseline,
+        getModels: () => {
+          const synced = state.synced
+          return synced !== undefined && synced.scope === state.activeScope ? synced.models : baseline.getModels()
+        },
+      })
     }
-    this.snapshot = { profiles, models }
-    return this.snapshot
+    this.snapshot = snapshot
+    return snapshot
+  }
+
+  /** Get or create the credential-scoped catalog state owned by one snapshot. */
+  private catalogState(snapshot: PiAiSnapshot, provider: string): ProviderCatalogState {
+    let state = snapshot.catalogs.get(provider)
+    if (state === undefined) {
+      state = { generation: 0 }
+      snapshot.catalogs.set(provider, state)
+    }
+    return state
   }
 
   /** The profile for one route within one snapshot, or the not-owned failure. */
@@ -318,6 +396,99 @@ export class PiAiAdapter extends LlmAdapter {
       throw new LlmError(`pi-ai adapter does not own provider "${provider}"`, 'NO_ADAPTER')
     }
     return profile
+  }
+
+  /** Resolve explicit credentials without falling back, or provider-native auth when no reference is named. */
+  private async listingAuth(
+    snapshot: PiAiSnapshot,
+    provider: string,
+    profile: ResolvedPiAiProviderProfile,
+    signal?: AbortSignal,
+  ): Promise<ProviderListingAuth> {
+    const apiKey = await this.config.resolveApiKey(provider, profile)
+    if (profile.apiKeyEnv !== undefined) return apiKey === undefined ? {} : { apiKey }
+    const resolved = await snapshot.models.getAuth(provider, {
+      ...signal === undefined ? {} : { signal },
+    })
+    const key = apiKey ?? resolved?.auth.apiKey
+    const headers = Object.fromEntries(
+      Object.entries(resolved?.auth.headers ?? {}).flatMap(([name, value]) =>
+        typeof value === 'string' ? [[name, value] as const] : []),
+    )
+    return {
+      ...key === undefined ? {} : { apiKey: key },
+      ...Object.keys(headers).length === 0 ? {} : { headers },
+      ...resolved?.auth.baseUrl === undefined ? {} : { baseURL: resolved.auth.baseUrl },
+    }
+  }
+
+  /** Whether this configuration generation can refresh a route from its provider. */
+  private canSynchronize(snapshot: PiAiSnapshot, provider: string): boolean {
+    const profile = this.profileOf(snapshot, provider)
+    return this.config.syncModels !== undefined && profile.followsProviderModels && profile.piProvider !== undefined
+  }
+
+  /**
+   * Stop admitting listing work, abort outstanding requests, and await their settlement.
+   * Late results neither publish catalogs nor emit notifications.
+   */
+  async dispose(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    for (const controller of this.syncControllers) controller.abort('pi-ai adapter disposed')
+    await Promise.allSettled([...this.syncOperations])
+  }
+
+  /** Refresh one credential scope at a time, retaining only that scope's last successful catalog. */
+  private async synchronize(
+    snapshot: PiAiSnapshot,
+    provider: string,
+    auth: ProviderListingAuth,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (this.closed) return
+    const profile = this.profileOf(snapshot, provider)
+    const load = this.config.syncModels
+    if (load === undefined || !profile.followsProviderModels || profile.piProvider === undefined) return
+    const baseline = profile.piProvider
+    const state = this.catalogState(snapshot, provider)
+    const scope = listingScope(auth)
+    if (state.activeScope !== scope) {
+      state.activeScope = scope
+      delete state.synced
+      state.generation += 1
+    }
+    const existing = state.inflight
+    if (existing?.scope === scope) return waitForSync(existing.operation, signal)
+    const generation = state.generation
+    const request = new AbortController()
+    const operation = (async () => {
+      using limit = deadline(request.signal, profile.modelsTimeoutMs, 'PI_AI_MODEL_SYNC_TIMEOUT')
+      try {
+        const synced = await load(provider, profile, auth, limit.signal)
+        if (synced === undefined || this.closed || this.snapshot !== snapshot
+          || state.generation !== generation || state.activeScope !== scope) return
+        const current = state.synced
+        const previous = current !== undefined && current.scope === scope ? current.models : baseline.getModels()
+        if (deepEqualJson(previous, synced)) return
+        state.synced = { scope, models: synced }
+        this.config.onModelsUpdated?.(provider)
+      } catch (error: unknown) {
+        if (!this.closed && this.snapshot === snapshot && state.generation === generation) {
+          this.config.onModelSyncError?.({ provider, error })
+        }
+      }
+    })()
+    state.inflight = { scope, operation }
+    this.syncControllers.add(request)
+    this.syncOperations.add(operation)
+    const cleanup = (): void => {
+      if (state.inflight?.operation === operation) delete state.inflight
+      this.syncControllers.delete(request)
+      this.syncOperations.delete(operation)
+    }
+    void operation.then(cleanup, cleanup)
+    await waitForSync(operation, signal)
   }
 
   /** The configured descriptor for one exact route/model pair within one snapshot. */
@@ -344,34 +515,51 @@ export class PiAiAdapter extends LlmAdapter {
     return this.current().profiles.get(provider)?.retryPolicy
   }
 
-  override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve().then(async () => {
-      const snapshot = this.current()
-      const profile = this.profileOf(snapshot, provider)
-      try { await this.config.resolveApiKey(provider, profile) }
-      catch (error) {
-        // A route whose named key does not resolve cannot serve a request, so it offers no models until the key is stored.
-        if (error instanceof LlmError && error.code === 'MISSING_CREDENTIAL') return []
-        throw error
-      }
-      return snapshot.models.getModels(provider).map(model => ({
-        provider,
-        id: model.id,
-        name: model.name,
-        inputModalities: [...model.input],
-      }))
-    })
+  override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const snapshot = this.current()
+    const profile = this.profileOf(snapshot, provider)
+    let auth: ProviderListingAuth
+    try {
+      auth = await this.listingAuth(snapshot, provider, profile)
+    } catch (error) {
+      // A route whose named key does not resolve cannot serve a request, so it offers no models until the key is stored.
+      if (error instanceof LlmError && error.code === 'MISSING_CREDENTIAL') return []
+      throw error
+    }
+    await this.synchronize(snapshot, provider, auth)
+    return snapshot.models.getModels(provider).map(model => ({
+      provider,
+      id: model.id,
+      name: model.name,
+      inputModalities: [...model.input],
+    }))
   }
 
-  override resolveModel(
+  override async resolveModel(
     provider: string,
     model: string,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
-    return Promise.resolve().then(() => {
-      const snapshot = this.current()
+    const snapshot = this.current()
+    return this.modelInfoWithSync(snapshot, provider, model, signal)
+  }
+
+  /** Resolve a model, giving an unknown id one chance to arrive through the provider's latest listing. */
+  private async modelInfoWithSync(
+    snapshot: PiAiSnapshot,
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<LlmResolvedModelInfo> {
+    try {
       return this.modelInfo(snapshot, provider, model)
-    })
+    } catch (error: unknown) {
+      if (!(error instanceof LlmError) || error.code !== 'UNKNOWN_MODEL' || !this.canSynchronize(snapshot, provider)) throw error
+    }
+    const profile = this.profileOf(snapshot, provider)
+    const auth = await this.listingAuth(snapshot, provider, profile, signal)
+    await this.synchronize(snapshot, provider, auth, signal)
+    return this.modelInfo(snapshot, provider, model)
   }
 
   private modelInfo(snapshot: PiAiSnapshot, provider: string, model: string): LlmResolvedModelInfo {
@@ -393,12 +581,12 @@ export class PiAiAdapter extends LlmAdapter {
     }
   }
 
-  override prepareCall(provider: string, model: string, _signal?: AbortSignal): Promise<PreparedAdapterCall> {
+  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
     const snapshot = this.current()
-    return Promise.resolve({
-      model: this.modelInfo(snapshot, provider, model),
+    return {
+      model: await this.modelInfoWithSync(snapshot, provider, model, signal),
       stream: options => this.streamWithSnapshot(options, snapshot),
-    })
+    }
   }
 
   stream(options: GenerateOptions): AsyncIterable<StreamChunk> {

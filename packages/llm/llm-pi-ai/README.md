@@ -82,7 +82,8 @@ Each profile may set a `retryPolicy`; omission uses normal mode with five retrie
 | `displayName` | provider name | Label shown by selector surfaces |
 | `api` | catalog protocol | Wire protocol; only needed for routes the catalog does not supply |
 | `baseURL` | catalog endpoint | Endpoint of every model on the route |
-| `models` | installed catalog | Replaces the route's catalog wholesale; each entry defaults from the installed model |
+| `models` | installed catalog, refreshed from the provider | Replaces the route's catalog wholesale and disables refresh; each entry defaults from the installed model |
+| `modelsTimeoutMs` | `5,000` | Deadline for each automatic provider-listing refresh |
 | `modelOverrides` | none | Reshapes individual installed-catalog models without replacing the rest |
 | `compat` | catalog detection | Wire-compatibility switches for unrecognized endpoints |
 | `defaultContextWindow` | `1,000,000` | Capacity fallback for undescribed models |
@@ -109,6 +110,8 @@ A provider pi-ai ships a login for can be signed into through the harness author
 ### Resolve the model catalog
 
 A profile's `models` list replaces the route's installed catalog rather than extending it; each entry defaults its unset fields from the installed model of the same id, so narrowing a route to two models, correcting one capacity, or adding a model newer than the installed catalog are one-line edits. `modelOverrides` reshapes individual installed-catalog models without that cost — correct one model, keep the other thirty-seven — and is refused when set beside a `models` list, on a hand-declared route, or naming a model the catalog does not describe, because a silently unchanged model would be a typo someone hunts for later.
+
+Without a non-empty `models` list, every catalog read refreshes a supported provider's listing and makes newly listed models available to subsequent requests. The refresh uses the route's explicit credential or provider-native ambient authentication. Listing metadata layers over installed model knowledge, `modelOverrides` still win, and installed models absent from the listing remain usable. A failed, timed-out, or unsupported refresh retains the last successful catalog in the same credential scope; concurrent reads share one request, and a changed listing emits `llm/models-updated` after publication. Plugin unload aborts and awaits admitted refreshes without publishing their results.
 
 ### Run with reasoning and wire compatibility
 
@@ -176,6 +179,7 @@ This event covers inference calls with or without a Session id, including auxili
 | [`src/replay.ts`](src/replay.ts) | Versioned `ReplayEnvelope` storage and validation |
 | [`src/prefix-binding.ts`](src/prefix-binding.ts) | Anthropic thinking omission after a request-prefix change |
 | [`src/discovery.ts`](src/discovery.ts) | Endpoint interrogation for configuration surfaces |
+| [`src/sync.ts`](src/sync.ts) | Provider-listed catalogs layered over installed model metadata |
 
 ### Registration and directory
 

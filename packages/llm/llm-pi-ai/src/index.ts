@@ -75,6 +75,7 @@ import { discoverModels } from './discovery.ts'
 import type { StoredModelDiscoveryProfile } from './discovery.ts'
 import { registerPiAiFlows } from './login.ts'
 import { providerDefaultsOf } from './provider-data.ts'
+import { syncProviderModels } from './sync.ts'
 import type { PiAiRequestHeaderContext } from './types.ts'
 
 export { PiAiAdapter } from './adapter.ts'
@@ -252,6 +253,11 @@ export function apply(ctx: Context, config: Config): void {
   const adapter = new PiAiAdapter({
     profiles,
     resolveApiKey,
+    syncModels: syncProviderModels,
+    onModelsUpdated: (provider) => { ctx.emit('llm/models-updated', provider) },
+    onModelSyncError: ({ provider, error }) => {
+      ctx.logger.warn(`llm-pi-ai: model listing refresh failed for route "${provider}"; keeping the previous catalog: %o`, error)
+    },
     auth,
     prepareHeaders: (request, headers) => ctx.waterfall('llm-pi-ai/request-headers', request, headers, () => headers),
     resolveAttachments: () => ctx.get('attachments'),
@@ -270,6 +276,7 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger.debug(`llm-pi-ai: omitted stale thinking from ${count} assistant message(s) for route "${provider}/${model}"`)
     },
   })
+  ctx.effect(() => () => adapter.dispose(), 'llm-pi-ai: model listing')
   // Independent of the route set: signing in is what makes a route worth
   // adding, so the flows are offered before any profile names their provider.
   // Scoped to the authorization seam rather than injected outright, because a

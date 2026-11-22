@@ -282,12 +282,12 @@ describe('PiAiAdapter provider routing', () => {
     expect(server.requests).toEqual([])
   })
 
-  it('reports unknown catalog models before network I/O', async () => {
-    const server = await mockServer([])
+  it('reports unknown catalog models after checking the listing without inference I/O', async () => {
+    const server = await mockServer([{ body: '{"data":[]}' }])
     const ctx = await harness(server.url)
     const result = await assemble(ctx, { model: 'not-in-the-catalog', messages: [] })
     expect(result.finish).toMatchObject({ kind: 'error', failure: { code: 'UNKNOWN_MODEL' } })
-    expect(server.requests).toEqual([])
+    expect(server.paths).toEqual(['/models'])
   })
 
   it('uses the catalog API implementation, including OpenAI Responses', async () => {
@@ -594,9 +594,10 @@ describe('provider profile lifecycle', () => {
   })
 
   it('exposes the installed pi-ai model catalog through provider-neutral metadata', async () => {
+    const server = await mockServer([{ body: '{"data":[]}' }])
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
-    await ctx.plugin(LlmPiAi, { providers: { openai: {} } })
+    await ctx.plugin(LlmPiAi, { providers: { openai: { baseURL: server.url } } })
     const models = await ctx.llm.listModels('openai')
     expect(models.find(model => model.id === 'gpt-4.1')).toEqual({
       provider: 'openai', id: 'gpt-4.1', name: 'GPT-4.1',
