@@ -155,3 +155,16 @@ it('refuses a separate pi soft target at the configuration boundary', () => {
   expect(() => { assertServiceable(routeWith({ imageTargetBytes: 1024 })() as Options) })
     .toThrow(/imageTargetBytes is not configurable/)
 })
+
+it('defaults and validates the provider listing deadline and refresh eligibility', () => {
+  expect(resolveProfiles({ deepseek: {} }).get('deepseek')).toMatchObject({
+    modelsTimeoutMs: 5000, followsProviderModels: true,
+  })
+  expect(resolveProfiles({ deepseek: { models: [] } }).get('deepseek')?.followsProviderModels).toBe(true)
+  expect(resolveProfiles({ deepseek: { models: [{ id: 'custom' }] } }).get('deepseek')?.followsProviderModels).toBe(false)
+  expect(resolveProfiles({ deepseek: { modelsTimeoutMs: 25 } }).get('deepseek')?.modelsTimeoutMs).toBe(25)
+  for (const modelsTimeoutMs of [0, -1, Infinity]) {
+    expect(() => resolveProfiles({ deepseek: { modelsTimeoutMs } })).toThrow(/modelsTimeoutMs must be a positive finite number/)
+    expect(routeWith({ modelsTimeoutMs })).toThrow()
+  }
+})

@@ -139,8 +139,8 @@ function routeAuth(spec: ProviderSpec, catalog: Provider | undefined): Provider[
  * Reuse an installed catalog provider with this route's models and identity.
  * Model dispatch stays with the catalog provider, so its API implementations,
  * compatibility quirks, and ambient credential discovery are preserved exactly.
- * Catalog-owned dynamic refresh is dropped: this route's catalog is the
- * settings document, and a background refresh would contradict it.
+ * Catalog-owned dynamic refresh is dropped: automatic refresh uses the
+ * adapter's profile credentials and protocol-specific listing reader instead.
  */
 function reuseCatalogProvider(base: Provider, spec: ProviderSpec): Provider {
   // Provider-level `baseUrl` is display metadata: pi-ai routes every request

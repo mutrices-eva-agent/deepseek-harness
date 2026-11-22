@@ -79,6 +79,9 @@ export const DEFAULT_CONTEXT_WINDOW = 1_000_000
 /** Output capability assumed for a model neither configuration nor the catalog sizes. */
 export const DEFAULT_MAX_TOKENS = 128_000
 
+/** Default deadline for refreshing one route's provider model listing. */
+export const DEFAULT_MODELS_TIMEOUT_MS = 5_000
+
 /**
  * Modalities assumed for a model neither configuration nor the catalog
  * declares. Text is the floor every supported protocol certainly carries, so
@@ -120,6 +123,8 @@ export interface PiAiProviderProfile {
    * unset fields from the installed model of the same id.
    */
   models?: PiAiModelProfile[]
+  /** Deadline for refreshing the provider's latest model listing (default five seconds). */
+  modelsTimeoutMs?: number
   /**
    * Installed-catalog customizations by model id: each entry reshapes that
    * one model with the same fields a {@link models} entry takes, while the
@@ -220,6 +225,10 @@ export interface ResolvedPiAiProviderProfile
   displayName: string
   /** Validated credential reference, when one is configured. */
   apiKeyEnv?: CredentialRef
+  /** Whether this route follows its provider listing instead of replacing it with a non-empty models list. */
+  followsProviderModels: boolean
+  /** Positive finite model-listing deadline after defaulting. */
+  modelsTimeoutMs: number
   /** Positive finite provider-idle interval after defaulting. */
   streamIdleTimeoutMs: number
   /** Positive request-level base64 image payload bound after defaulting. */
@@ -364,6 +373,7 @@ const profile = z.object({
   api: z.union(supportedProtocols()),
   baseURL: z.string(),
   models: z.array(modelProfile),
+  modelsTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_MODELS_TIMEOUT_MS),
   modelOverrides: z.dict(modelOverride),
   compat: compatProfile,
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
@@ -471,6 +481,12 @@ export function resolveProfiles(
       throw new Error(`llm-pi-ai: provider "${provider}" has an empty displayName`)
     }
     assertValidHeaders(provider, source.headers)
+    const modelsTimeoutMs = source.modelsTimeoutMs ?? DEFAULT_MODELS_TIMEOUT_MS
+    if (!Number.isFinite(modelsTimeoutMs) || modelsTimeoutMs <= 0 || modelsTimeoutMs > MAX_TIMER_DELAY_MS) {
+      throw new Error(
+        `llm-pi-ai: provider "${provider}" modelsTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`,
+      )
+    }
     const streamIdleTimeoutMs = source.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS
     if (!Number.isFinite(streamIdleTimeoutMs)
       || streamIdleTimeoutMs <= 0
@@ -556,6 +572,8 @@ export function resolveProfiles(
       provider,
       displayName,
       ...apiKeyEnv === undefined ? {} : { apiKeyEnv: credentialRef(apiKeyEnv) },
+      followsProviderModels: source.models === undefined || source.models.length === 0,
+      modelsTimeoutMs,
       streamIdleTimeoutMs,
       maxRequestImageBytes,
       maxRequestImages,

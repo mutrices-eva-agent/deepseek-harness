@@ -82,7 +82,8 @@ kind: "package-reference"
 | `displayName` | 提供方名 | 选择器界面显示的标签 |
 | `api` | 目录协议 | 协议格式；仅目录不提供的路由需要 |
 | `baseURL` | 目录端点 | 路由上所有模型的端点 |
-| `models` | 已安装目录 | 整体替换路由目录；每个条目从已安装模型取默认值 |
+| `models` | 已安装目录，并从提供方刷新 | 整体替换路由目录并停止刷新；每个条目从已安装模型取默认值 |
+| `modelsTimeoutMs` | `5,000` | 每次自动刷新提供方模型列表的期限 |
 | `modelOverrides` | 无 | 重塑个别已安装目录模型，而不替换其余模型 |
 | `compat` | 目录检测 | 无法识别端点的协议兼容开关 |
 | `defaultContextWindow` | `1,000,000` | 未描述模型的容量回退 |
@@ -109,6 +110,8 @@ pi-ai 提供登录的提供方可以通过 harness 授权 seam 登录：流程�
 ### 解析模型目录
 
 profile 的 `models` 列表会替换而非扩展路由的已安装目录；每个条目从同 id 已安装模型取未设置字段的默认值，因此把路由收窄到两个模型、修正一个容量或添加比已安装目录更新的模型都是一行编辑。`modelOverrides` 无需该代价即可重塑个别已安装目录模型——修正一个模型，保留其余三十七个——当它与 `models` 列表并存、位于手工声明路由上、或点名目录未描述的模型时会被拒绝，因为静默不变的模型会成为别人日后寻找的拼写错误。
+
+没有非空 `models` 列表时，每次目录读取都会刷新受支持提供方的模型列表，并让新列出的模型可用于后续请求。列表元数据叠加在已安装模型知识之上，`modelOverrides` 仍然优先，列表未包含的已安装模型保持可用。刷新失败、超时或不受支持时保留最近一次成功的目录；并发读取共享一个请求，目录变化在发布后发出 `llm/models-updated`。
 
 ### 带推理（reasoning）与协议兼容运行
 
@@ -176,6 +179,7 @@ Config 更新严格验证发生变化的 provider。初始加载将已存储的�
 | [`src/replay.ts`](src/replay.ts) | 带版本的 `ReplayEnvelope` 存储与校验 |
 | [`src/prefix-binding.ts`](src/prefix-binding.ts) | 请求前缀变化后省略 Anthropic thinking |
 | [`src/discovery.ts`](src/discovery.ts) | 面向配置界面的端点询问 |
+| [`src/sync.ts`](src/sync.ts) | 叠加在已安装模型元数据上的提供方列表目录 |
 
 ### 注册与目录
 

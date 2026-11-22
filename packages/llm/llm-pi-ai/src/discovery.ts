@@ -48,6 +48,15 @@ const LISTABLE_PROTOCOLS: ReadonlySet<string> = new Set([
   'openai-responses',
 ])
 
+/**
+ * Whether this build can read a protocol's provider model listing.
+ * @param api - resolved wire protocol.
+ * @returns true for a protocol with a supported listing endpoint.
+ */
+export function supportsModelDiscovery(api: string): boolean {
+  return LISTABLE_PROTOCOLS.has(api)
+}
+
 /** Stable API version required by Anthropic's model-listing endpoint. */
 const ANTHROPIC_VERSION = '2023-06-01'
 
