@@ -276,6 +276,7 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger.debug(`llm-pi-ai: omitted stale thinking from ${count} assistant message(s) for route "${provider}/${model}"`)
     },
   })
+  ctx.effect(() => () => adapter.dispose(), 'llm-pi-ai: model listing')
   // Independent of the route set: signing in is what makes a route worth
   // adding, so the flows are offered before any profile names their provider.
   // Scoped to the authorization seam rather than injected outright, because a

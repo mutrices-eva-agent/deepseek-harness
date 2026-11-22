@@ -11,6 +11,16 @@ import {
 import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { discoverModels, supportsModelDiscovery } from './discovery.ts'
 
+/** Authentication and endpoint facts resolved for one provider-listing operation. */
+export interface ProviderListingAuth {
+  /** Explicit or provider-native API key, when one is available. */
+  apiKey?: string
+  /** Provider-native authorization headers, excluding null-valued removals. */
+  headers?: Readonly<Record<string, string>>
+  /** Provider-native endpoint override, subordinate to the configured baseURL. */
+  baseURL?: string
+}
+
 /** Select the listing protocol without changing existing models' individual protocols. */
 function listingApi(profile: ResolvedPiAiProviderProfile): string | undefined {
   if (profile.api !== undefined) return profile.api
@@ -26,27 +36,30 @@ function listingApi(profile: ResolvedPiAiProviderProfile): string | undefined {
  * remain usable. Explicit model overrides win over listing fields.
  * @param provider - provider route being refreshed.
  * @param profile - resolved route configuration without a replacing models list.
- * @param apiKey - resolved credential, or undefined for ambient/unauthenticated discovery.
+ * @param auth - explicit or provider-native authentication and endpoint facts.
  * @param signal - optional cancellation and deadline for the listing request.
  * @returns the full catalog to serve, or undefined when this route has no supported listing endpoint.
  */
 export async function syncProviderModels(
   provider: string,
   profile: ResolvedPiAiProviderProfile,
-  apiKey: string | undefined,
+  auth: ProviderListingAuth,
   signal?: AbortSignal,
 ): Promise<readonly Model<Api>[] | undefined> {
   const current = profile.piProvider
-  const baseURL = profile.baseURL ?? current?.baseUrl
+  const baseURL = profile.baseURL ?? auth.baseURL ?? current?.baseUrl
   const api = listingApi(profile)
   if (current === undefined || baseURL === undefined || api === undefined || !supportsModelDiscovery(api)) return undefined
 
   const discovered = await discoverModels({
     baseURL,
     api,
-    ...apiKey === undefined ? {} : { apiKey },
+    ...auth.apiKey === undefined ? {} : { apiKey: auth.apiKey },
     ...signal === undefined ? {} : { signal },
-  }, () => ({ headers: profile.headers, resolveApiKey: () => Promise.resolve(apiKey) }))
+  }, () => ({
+    headers: { ...auth.headers, ...profile.headers },
+    resolveApiKey: () => Promise.resolve(auth.apiKey),
+  }))
   const overrides = profile.modelOverrides ?? {}
   const entries: PiAiModelProfile[] = discovered.map(model => ({
     id: model.id,
